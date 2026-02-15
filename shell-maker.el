@@ -316,9 +316,6 @@ Optionally use MODE-MAP."
     (shell-maker--output-filter (shell-maker--process)
                                 (shell-maker-prompt config))
     (set-marker comint-last-input-start (shell-maker--pm))
-    (set-process-filter (get-buffer-process
-                         (shell-maker-buffer config))
-                        'shell-maker--output-filter)
     (set-buffer-modified-p nil)))
 
 (cl-defun shell-maker--write-reply (&key config reply failed on-output)
@@ -337,14 +334,7 @@ Use ON-OUTPUT function to monitor output text."
                                         'invisible (not shell-maker--show-invisible-markers))
                           "")
                         (shell-maker-prompt shell-maker--config))))
-    (with-current-buffer shell-buffer
-      (if (eobp) ;; auto-scroll
-          (progn
-            (goto-char (point-max))
-            (shell-maker--output-filter (shell-maker--process) output))
-        (save-excursion
-          (goto-char (point-max))
-          (shell-maker--output-filter (shell-maker--process) output)))))
+    (shell-maker--output-filter (shell-maker--process) output))
   (when on-output
     (funcall on-output reply)))
 
@@ -1304,19 +1294,9 @@ Use ON-OUTPUT function to monitor output text."
     (error "Missing config"))
   (unless reply
     (error "Missing reply"))
-  (let ((inhibit-read-only t)
-        (shell-buffer (shell-maker-buffer config))
-        (auto-scroll (eobp)))
-    (with-current-buffer shell-buffer
-      (if auto-scroll
-          (progn
-            (goto-char (point-max))
-            (shell-maker--output-filter (shell-maker--process) reply))
-        (save-excursion
-          (goto-char (point-max))
-          (shell-maker--output-filter (shell-maker--process) reply))))
-    (when on-output
-      (funcall on-output reply))))
+  (shell-maker--output-filter (shell-maker--process) reply)
+  (when on-output
+    (funcall on-output reply)))
 
 (cl-defun shell-maker-write-output (&key config output on-output)
   "Write OUTPUT to CONFIG shell buffer.
@@ -1336,17 +1316,14 @@ Must be called from within the shell buffer.
 SUCCESS indicates whether the command succeeded.
 Use ON-OUTPUT function to monitor output text."
   (setq shell-maker--busy nil)
-  (let ((auto-scroll (eobp)))
-    (shell-maker--write-reply :config config
-                              :reply (save-excursion
-                                       (goto-char (point-max))
-                                       (cond ((looking-back "\n\n" nil) "")
-                                             ((looking-back "\n" nil) "\n")
-                                             (t "\n\n")))
-                              :on-output on-output
-                              :failed (not success))
-    (when auto-scroll
-      (goto-char (point-max)))))
+  (shell-maker--write-reply :config config
+                            :reply (save-excursion
+                                     (goto-char (point-max))
+                                     (cond ((looking-back "\n\n" nil) "")
+                                           ((looking-back "\n" nil) "\n")
+                                           (t "\n\n")))
+                            :on-output on-output
+                            :failed (not success)))
 
 (defmacro shell-maker-with-auto-scroll-edit (&rest body)
   "Execute BODY, preserving point unless already at end of buffer."
@@ -1600,54 +1577,25 @@ Returns a list of (command . output) cons."
     (nreverse result)))
 
 (defun shell-maker--output-filter (process string)
-  "Copy of `comint-output-filter' but avoids fontifying non-prompt text.
+  "Insert STRING into PROCESS buffer using comint's output filter.
 
-Uses PROCESS and STRING same as `comint-output-filter'."
-  (when-let ((oprocbuf (process-buffer process)))
-    (with-current-buffer oprocbuf
-      (let ((inhibit-read-only t))
-        (save-restriction
-          (widen)
-          (goto-char (point-max))
-          (set-marker comint-last-output-start (point))
-          (insert string)
-          (set-marker (process-mark process) (point))
-          (goto-char (process-mark process))
-          (unless comint-use-prompt-regexp
-            (with-silent-modifications
-              (add-text-properties comint-last-output-start (point)
-                                   `(rear-nonsticky
-                                     ,shell-maker--prompt-rear-nonsticky
-                                     front-sticky
-                                     (field inhibit-line-move-field-capture)
-                                     field output
-                                     inhibit-line-move-field-capture t))))
-          (when-let* ((prompt-start (save-excursion (forward-line 0) (point)))
-                      (inhibit-read-only t)
-                      (prompt (string-match
-                               comint-prompt-regexp
-                               (buffer-substring prompt-start (point)))))
-            (with-silent-modifications
-              (or (= (point-min) prompt-start)
-                  (get-text-property (1- prompt-start) 'read-only)
-                  (put-text-property (1- prompt-start)
-                                     prompt-start 'read-only 'fence))
-              (add-text-properties prompt-start (point)
-                                   '(read-only t front-sticky (read-only))))
-            (when comint-last-prompt
-              (font-lock--remove-face-from-text-property
-               (car comint-last-prompt)
-               (cdr comint-last-prompt)
-               'font-lock-face
-               'comint-highlight-prompt))
-            (setq comint-last-prompt
-                  (cons (copy-marker prompt-start) (point-marker)))
-            (font-lock-append-text-property prompt-start (point)
-                                            'font-lock-face
-                                            'comint-highlight-prompt)
-            (add-text-properties prompt-start (point)
-                                 `(rear-nonsticky
-                                   ,shell-maker--prompt-rear-nonsticky))))))))
+Delegates to `comint-output-filter' so that all comint output
+machinery runs: `comint-output-filter-functions' (including
+`comint-postoutput-scroll-to-bottom'), the saved-point pattern,
+and `comint--mark-as-output'.
+
+Before calling `comint-output-filter', advances `process-mark' and
+point to `point-max'.  This is necessary because shell-maker buffers
+insert content (fragments, tool output) directly into the buffer
+without going through comint, so `process-mark' can fall behind
+`point-max'.  `comint-output-filter' inserts at `process-mark', so
+it must be at the end for output to appear at the end."
+  (when-let ((buf (process-buffer process)))
+    (with-current-buffer buf
+      (let ((pmax (point-max)))
+        (set-marker (process-mark process) pmax)
+        (goto-char pmax))))
+  (comint-output-filter process string))
 
 (defun shell-maker-buffer (config)
   "Get buffer from CONFIG."
